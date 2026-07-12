@@ -1,4 +1,4 @@
-// Take My Med — local-first medication reminders for mobile and web.
+// Take Your Med — local-first medication reminders for mobile and web.
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -14,7 +14,7 @@ const rose = Color(0xFFE84A67), violet = Color(0xFF8B7CF6);
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Alerts.instance.init();
-  runApp(const TakeMyMedApp());
+  runApp(const TakeYourMedApp());
 }
 
 class Medication {
@@ -148,7 +148,7 @@ class Alerts {
           id: m.id * 10 + day,
           title: 'Time to take ${m.name}',
           body: m.notes.isEmpty
-              ? 'Open Take My Med to confirm your dose'
+              ? 'Open Take Your Med to confirm your dose'
               : m.notes,
           scheduledDate: at,
           notificationDetails: d,
@@ -173,7 +173,7 @@ class Alerts {
             id: m.id * 100 + x,
             title: 'Time to take ${m.name}',
             body: m.notes.isEmpty
-                ? 'Open Take My Med to confirm your dose'
+                ? 'Open Take Your Med to confirm your dose'
                 : m.notes,
             scheduledDate: at,
             notificationDetails: d,
@@ -193,18 +193,18 @@ class Alerts {
   }
 }
 
-class TakeMyMedApp extends StatefulWidget {
-  const TakeMyMedApp({super.key});
+class TakeYourMedApp extends StatefulWidget {
+  const TakeYourMedApp({super.key});
   @override
-  State<TakeMyMedApp> createState() => _AppState();
+  State<TakeYourMedApp> createState() => _AppState();
 }
 
-class _AppState extends State<TakeMyMedApp> {
+class _AppState extends State<TakeYourMedApp> {
   bool dark = false;
   @override
   Widget build(BuildContext c) => MaterialApp(
     debugShowCheckedModeBanner: false,
-    title: 'Take My Med',
+    title: 'Take Your Med',
     themeMode: dark ? ThemeMode.dark : ThemeMode.light,
     theme: _theme(false),
     darkTheme: _theme(true),
@@ -279,7 +279,7 @@ class _HomeState extends State<HomePage> {
       barrierDismissible: false,
       builder: (_) => AlertDialog(
         icon: const Icon(Icons.favorite_rounded, color: rose, size: 44),
-        title: const Text('Welcome to Take My Med'),
+        title: const Text('Welcome to Take Your Med'),
         content: const Text(
           'A calmer, clearer way to stay on top of every dose. Add your first medication and we’ll keep watch.',
         ),
@@ -350,7 +350,7 @@ class _HomeState extends State<HomePage> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
-                                    'TAKE MY MED',
+                                    'TAKE YOUR MED',
                                     style: TextStyle(
                                       fontSize: 12,
                                       fontWeight: FontWeight.w800,

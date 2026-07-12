@@ -1,4 +1,4 @@
-# Take My Med
+# Take Your Med
 
 A calm, modern medication reminder for iOS, Android, and web. Create recurring or date-specific schedules, receive time-sensitive alerts, and keep an editable history of every taken dose.
 

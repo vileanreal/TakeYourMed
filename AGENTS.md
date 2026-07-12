@@ -1,6 +1,6 @@
-# Take My Med — Product & Engineering Context
+# Take Your Med — Product & Engineering Context
 
-Take My Med is a clean, modern, single-page medication reminder app for iOS, Android, and web. Its visual identity uses reddish pink `#E84A67` and light violet `#8B7CF6`, with layered pastel gradients and a compact day/night control in the upper right.
+Take Your Med is a clean, modern, single-page medication reminder app for iOS, Android, and web. Its visual identity uses reddish pink `#E84A67` and light violet `#8B7CF6`, with layered pastel gradients and a compact day/night control in the upper right.
 
 ## Required experience
 - Show a welcome dialog on first launch.

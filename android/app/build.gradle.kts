@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.vileanreal.take_my_med"
+    namespace = "com.vileanreal.take_your_med"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -17,7 +17,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.vileanreal.take_my_med"
+        applicationId = "com.vileanreal.take_your_med"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

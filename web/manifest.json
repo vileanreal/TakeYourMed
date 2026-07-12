@@ -1,6 +1,6 @@
 {
-    "name": "take_my_med",
-    "short_name": "take_my_med",
+    "name": "Take Your Med",
+    "short_name": "TakeYourMed",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
