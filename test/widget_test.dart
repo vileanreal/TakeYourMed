@@ -73,6 +73,50 @@ void main() {
     });
   });
 
+  group('Alarm preferences', () {
+    test('defaults to a one-minute sound and vibration alarm', () {
+      const preferences = AlarmPreferences();
+      expect(preferences.durationSeconds, 60);
+      expect(preferences.durationLabel, '1 minute');
+      expect(preferences.sound, isTrue);
+      expect(preferences.vibrate, isTrue);
+      expect(preferences.autoDisplay, isTrue);
+    });
+
+    test('persists customized alert behavior', () async {
+      SharedPreferences.setMockInitialValues({});
+      const custom = AlarmPreferences(
+        durationSeconds: 120,
+        sound: false,
+        vibrate: true,
+        autoDisplay: false,
+      );
+      await custom.save();
+      final loaded = await AlarmPreferences.load();
+      expect(loaded.durationSeconds, 120);
+      expect(loaded.sound, isFalse);
+      expect(loaded.vibrate, isTrue);
+      expect(loaded.autoDisplay, isFalse);
+    });
+
+    test('notification details enforce settings and hard timeout', () {
+      Alerts.instance.preferences = const AlarmPreferences(
+        durationSeconds: 60,
+        sound: false,
+        vibrate: true,
+        autoDisplay: false,
+      );
+      final android = Alerts.instance.details.android!;
+      expect(android.timeoutAfter, 60000);
+      expect(android.playSound, isFalse);
+      expect(android.enableVibration, isTrue);
+      expect(android.fullScreenIntent, isFalse);
+      expect(android.additionalFlags, isNotNull);
+      expect(android.additionalFlags, contains(4));
+      Alerts.instance.preferences = const AlarmPreferences();
+    });
+  });
+
   testWidgets('renders the home experience', (tester) async {
     SharedPreferences.setMockInitialValues({'welcomed': true});
     await tester.pumpWidget(const TakeYourMedApp());
@@ -115,7 +159,11 @@ void main() {
     expect(result, hasLength(2));
   });
 
-  testWidgets('alarm swipe right confirms the dose', (tester) async {
+  testWidgets('alarm uses buttons and Taken confirms the dose', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     var taken = false;
     await tester.pumpWidget(
       MaterialApp(
@@ -128,12 +176,46 @@ void main() {
       ),
     );
 
-    await tester.drag(
-      find.byKey(const ValueKey('dose-alarm-slider')),
-      const Offset(320, 0),
-    );
+    expect(find.byType(Dismissible), findsNothing);
+    expect(find.byKey(const ValueKey('dose-snooze-button')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('dose-taken-button')));
     await tester.pumpAndSettle();
     expect(taken, isTrue);
+  });
+
+  testWidgets('alarm check exposes duration and behavior controls', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    AlarmPreferences? saved;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: AlertCenterSheet(
+            loadStatus: () async => const AlertStatus(true, true, 2),
+            initialPreferences: const AlarmPreferences(),
+            onEnable: () async {},
+            onSave: (value) async => saved = value,
+            onTest: () async {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('1 minute'), findsOneWidget);
+    expect(find.text('Sound'), findsOneWidget);
+    expect(find.text('Vibrate'), findsOneWidget);
+    expect(find.text('Open alert automatically'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('apply-alarm-settings')),
+      400,
+    );
+    await tester.tap(find.byKey(const ValueKey('apply-alarm-settings')));
+    await tester.pumpAndSettle();
+    expect(saved?.durationSeconds, 60);
   });
 
   test('Android manifest includes scheduled alarm delivery components', () {

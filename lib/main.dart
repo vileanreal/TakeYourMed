@@ -96,12 +96,69 @@ class Medication {
   }
 }
 
+class AlarmPreferences {
+  const AlarmPreferences({
+    this.durationSeconds = 60,
+    this.sound = true,
+    this.vibrate = true,
+    this.autoDisplay = true,
+  });
+  final int durationSeconds;
+  final bool sound, vibrate, autoDisplay;
+
+  AlarmPreferences copyWith({
+    int? durationSeconds,
+    bool? sound,
+    bool? vibrate,
+    bool? autoDisplay,
+  }) => AlarmPreferences(
+    durationSeconds: durationSeconds ?? this.durationSeconds,
+    sound: sound ?? this.sound,
+    vibrate: vibrate ?? this.vibrate,
+    autoDisplay: autoDisplay ?? this.autoDisplay,
+  );
+
+  static Future<AlarmPreferences> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final storedDuration = prefs.getInt('alarmDurationSeconds') ?? 60;
+    final duration = const [30, 60, 120, 300].contains(storedDuration)
+        ? storedDuration
+        : 60;
+    return AlarmPreferences(
+      durationSeconds: duration,
+      sound: prefs.getBool('alarmSound') ?? true,
+      vibrate: prefs.getBool('alarmVibrate') ?? true,
+      autoDisplay: prefs.getBool('alarmAutoDisplay') ?? true,
+    );
+  }
+
+  Future<void> save() async {
+    final prefs = await SharedPreferences.getInstance();
+    await Future.wait([
+      prefs.setInt('alarmDurationSeconds', durationSeconds),
+      prefs.setBool('alarmSound', sound),
+      prefs.setBool('alarmVibrate', vibrate),
+      prefs.setBool('alarmAutoDisplay', autoDisplay),
+    ]);
+  }
+
+  String get durationLabel => switch (durationSeconds) {
+    30 => '30 seconds',
+    60 => '1 minute',
+    120 => '2 minutes',
+    300 => '5 minutes',
+    _ => '$durationSeconds seconds',
+  };
+}
+
 class Alerts {
   Alerts._();
   static final instance = Alerts._();
   final plugin = FlutterLocalNotificationsPlugin();
   final ValueNotifier<NotificationResponse?> responses = ValueNotifier(null);
   NotificationResponse? initialResponse;
+  AlarmPreferences preferences = const AlarmPreferences();
+  bool initialized = false;
 
   AndroidFlutterLocalNotificationsPlugin? get _android => plugin
       .resolvePlatformSpecificImplementation<
@@ -109,6 +166,7 @@ class Alerts {
       >();
 
   Future<void> init() async {
+    preferences = await AlarmPreferences.load();
     tz_data.initializeTimeZones();
     if (!kIsWeb) {
       try {
@@ -149,6 +207,7 @@ class Alerts {
         responses.value = response;
       },
     );
+    initialized = true;
     final launch = await plugin.getNotificationAppLaunchDetails();
     if (launch?.didNotificationLaunchApp ?? false) {
       initialResponse = launch?.notificationResponse;
@@ -157,20 +216,29 @@ class Alerts {
 
   NotificationDetails get details => NotificationDetails(
     android: AndroidNotificationDetails(
-      'medicine_alarms_v2',
-      'Medicine alarms',
+      'medicine_alarms_v3_s${preferences.sound ? 1 : 0}_v${preferences.vibrate ? 1 : 0}',
+      preferences.sound
+          ? preferences.vibrate
+                ? 'Medicine alarms: sound + vibration'
+                : 'Medicine alarms: sound'
+          : preferences.vibrate
+          ? 'Medicine alarms: vibration'
+          : 'Medicine alarms: silent',
       channelDescription: 'Urgent alarms for medication doses',
       importance: Importance.max,
       priority: Priority.max,
       category: AndroidNotificationCategory.alarm,
       visibility: NotificationVisibility.public,
-      fullScreenIntent: true,
-      ongoing: true,
-      autoCancel: false,
-      playSound: true,
-      enableVibration: true,
+      fullScreenIntent: preferences.autoDisplay,
+      ongoing: false,
+      autoCancel: true,
+      timeoutAfter: preferences.durationSeconds * 1000,
+      playSound: preferences.sound,
+      enableVibration: preferences.vibrate,
       audioAttributesUsage: AudioAttributesUsage.alarm,
-      additionalFlags: Int32List.fromList([4]),
+      additionalFlags: preferences.sound || preferences.vibrate
+          ? Int32List.fromList([4])
+          : null,
       actions: const [
         AndroidNotificationAction('taken', 'Taken', showsUserInterface: true),
         AndroidNotificationAction(
@@ -180,15 +248,24 @@ class Alerts {
         ),
       ],
     ),
-    iOS: const DarwinNotificationDetails(
+    iOS: DarwinNotificationDetails(
       presentAlert: true,
-      presentSound: true,
+      presentSound: preferences.sound,
       interruptionLevel: InterruptionLevel.timeSensitive,
       categoryIdentifier: 'medicine_alarm',
     ),
   );
 
+  Future<void> savePreferences(AlarmPreferences value) async {
+    preferences = value;
+    await value.save();
+    if (!kIsWeb && value.autoDisplay) {
+      await _android?.requestFullScreenIntentPermission();
+    }
+  }
+
   Future<AlertStatus> status() async {
+    if (!initialized) return const AlertStatus(true, true, 0);
     if (kIsWeb) return const AlertStatus(true, true, 0);
     final enabled = await _android?.areNotificationsEnabled() ?? true;
     final exact = await _android?.canScheduleExactNotifications() ?? true;
@@ -209,7 +286,9 @@ class Alerts {
     if (!(await _android?.canScheduleExactNotifications() ?? true)) {
       await _android?.requestExactAlarmsPermission();
     }
-    await _android?.requestFullScreenIntentPermission();
+    if (preferences.autoDisplay) {
+      await _android?.requestFullScreenIntentPermission();
+    }
     await plugin
         .resolvePlatformSpecificImplementation<
           IOSFlutterLocalNotificationsPlugin
@@ -219,6 +298,7 @@ class Alerts {
   }
 
   Future<void> schedule(Medication m) async {
+    if (!initialized) return;
     await cancel(m.id);
     if (m.finished) return;
     final exact = await _android?.canScheduleExactNotifications() ?? true;
@@ -235,7 +315,7 @@ class Alerts {
             id: _id('${m.id}|$minutes|weekday|$day'),
             title: 'Time to take ${m.name}',
             body: m.notes.isEmpty
-                ? 'Swipe or tap to confirm this dose'
+                ? 'Tap to view Taken and Snooze options'
                 : m.notes,
             scheduledDate: at,
             notificationDetails: details,
@@ -260,7 +340,7 @@ class Alerts {
               id: _id('${m.id}|$minutes|$value'),
               title: 'Time to take ${m.name}',
               body: m.notes.isEmpty
-                  ? 'Swipe or tap to confirm this dose'
+                  ? 'Tap to view Taken and Snooze options'
                   : m.notes,
               scheduledDate: at,
               notificationDetails: details,
@@ -883,7 +963,15 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
       useSafeArea: true,
       builder: (_) => AlertCenterSheet(
         loadStatus: Alerts.instance.status,
+        initialPreferences: Alerts.instance.preferences,
         onEnable: _enableAlerts,
+        onSave: (preferences) async {
+          await Alerts.instance.savePreferences(preferences);
+          for (final med in meds.where((item) => !item.finished)) {
+            await Alerts.instance.schedule(med);
+          }
+          await _refreshAlertStatus();
+        },
         onTest: () async {
           if (!(alertStatus?.notifications ?? false)) {
             await _enableAlerts();
@@ -1970,84 +2058,238 @@ class AlertCenterSheet extends StatefulWidget {
   const AlertCenterSheet({
     super.key,
     required this.loadStatus,
+    required this.initialPreferences,
     required this.onEnable,
+    required this.onSave,
     required this.onTest,
   });
   final Future<AlertStatus> Function() loadStatus;
+  final AlarmPreferences initialPreferences;
   final Future<void> Function() onEnable, onTest;
+  final Future<void> Function(AlarmPreferences) onSave;
   @override
   State<AlertCenterSheet> createState() => _AlertCenterSheetState();
 }
 
 class _AlertCenterSheetState extends State<AlertCenterSheet> {
   late Future<AlertStatus> status;
+  late AlarmPreferences preferences;
+  bool saving = false;
   @override
   void initState() {
     super.initState();
     status = widget.loadStatus();
+    preferences = widget.initialPreferences;
   }
 
-  void refresh() => setState(() => status = widget.loadStatus());
+  void refresh() {
+    setState(() {
+      status = widget.loadStatus();
+    });
+  }
+
+  Future<void> applySettings() async {
+    if (saving) return;
+    setState(() => saving = true);
+    await widget.onSave(preferences);
+    if (!mounted) return;
+    setState(() => saving = false);
+    refresh();
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Alarm settings applied.')));
+  }
+
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.all(24),
-    child: FutureBuilder<AlertStatus>(
-      future: status,
-      builder: (_, snapshot) {
-        final value = snapshot.data;
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Medicine alarm check',
-              style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
+  Widget build(BuildContext context) => SizedBox(
+    height: MediaQuery.sizeOf(context).height * .88,
+    child: ListView(
+      padding: const EdgeInsets.fromLTRB(24, 16, 24, 28),
+      children: [
+        Center(
+          child: Container(
+            width: 42,
+            height: 5,
+            decoration: BoxDecoration(
+              color: Colors.grey.withValues(alpha: .35),
+              borderRadius: BorderRadius.circular(8),
             ),
-            const SizedBox(height: 8),
-            const Text(
-              'Keep all alarm permissions enabled for reminders while the app is closed or the screen is locked.',
+          ),
+        ),
+        const SizedBox(height: 18),
+        const Text(
+          'Medicine alarm check',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Configure how long alarms run and how they get your attention.',
+        ),
+        const SizedBox(height: 16),
+        FutureBuilder<AlertStatus>(
+          future: status,
+          builder: (_, snapshot) {
+            final value = snapshot.data;
+            return Column(
+              children: [
+                _StatusRow(
+                  label: 'Notifications',
+                  ready: value?.notifications ?? false,
+                ),
+                _StatusRow(
+                  label: 'Precise alarm timing',
+                  ready: value?.exact ?? false,
+                ),
+                _StatusRow(
+                  label: '${value?.pending ?? 0} alarms scheduled',
+                  ready: (value?.pending ?? 0) > 0,
+                  neutral: (value?.pending ?? 0) == 0,
+                ),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 10),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: violet.withValues(alpha: .08),
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: violet.withValues(alpha: .15)),
+          ),
+          child: Material(
+            color: Colors.transparent,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Alert behavior',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Duration, vibration, and automatic display apply to Android. iOS follows its system alert rules.',
+                  style: TextStyle(fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<int>(
+                  key: const ValueKey('alarm-duration'),
+                  initialValue: preferences.durationSeconds,
+                  decoration: const InputDecoration(
+                    labelText: 'Alert duration',
+                    prefixIcon: Icon(Icons.timer_outlined),
+                  ),
+                  items: const [
+                    DropdownMenuItem(value: 30, child: Text('30 seconds')),
+                    DropdownMenuItem(value: 60, child: Text('1 minute')),
+                    DropdownMenuItem(value: 120, child: Text('2 minutes')),
+                    DropdownMenuItem(value: 300, child: Text('5 minutes')),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) {
+                      setState(
+                        () => preferences = preferences.copyWith(
+                          durationSeconds: value,
+                        ),
+                      );
+                    }
+                  },
+                ),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  key: const ValueKey('alarm-sound'),
+                  contentPadding: EdgeInsets.zero,
+                  secondary: const Icon(Icons.volume_up_outlined),
+                  title: const Text('Sound'),
+                  subtitle: const Text('Repeat the alarm sound until stopped'),
+                  value: preferences.sound,
+                  onChanged: (value) => setState(
+                    () => preferences = preferences.copyWith(sound: value),
+                  ),
+                ),
+                SwitchListTile(
+                  key: const ValueKey('alarm-vibrate'),
+                  contentPadding: EdgeInsets.zero,
+                  secondary: const Icon(Icons.vibration_rounded),
+                  title: const Text('Vibrate'),
+                  value: preferences.vibrate,
+                  onChanged: (value) => setState(
+                    () => preferences = preferences.copyWith(vibrate: value),
+                  ),
+                ),
+                SwitchListTile(
+                  key: const ValueKey('alarm-auto-display'),
+                  contentPadding: EdgeInsets.zero,
+                  secondary: const Icon(Icons.open_in_new_rounded),
+                  title: const Text('Open alert automatically'),
+                  subtitle: const Text(
+                    'Show the full-screen alert when Android permits it',
+                  ),
+                  value: preferences.autoDisplay,
+                  onChanged: (value) => setState(
+                    () =>
+                        preferences = preferences.copyWith(autoDisplay: value),
+                  ),
+                ),
+                if (!preferences.sound && !preferences.vibrate)
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.withValues(alpha: .12),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.volume_off_rounded, color: Colors.orange),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'This alarm will be silent.',
+                            style: TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
             ),
-            const SizedBox(height: 18),
-            _StatusRow(
-              label: 'Notifications',
-              ready: value?.notifications ?? false,
-            ),
-            _StatusRow(
-              label: 'Precise alarm timing',
-              ready: value?.exact ?? false,
-            ),
-            _StatusRow(
-              label: '${value?.pending ?? 0} alarms scheduled',
-              ready: (value?.pending ?? 0) > 0,
-              neutral: (value?.pending ?? 0) == 0,
-            ),
-            const SizedBox(height: 18),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: () async {
-                  await widget.onEnable();
-                  refresh();
-                },
-                icon: const Icon(Icons.settings_rounded),
-                label: const Text('Enable required access'),
-              ),
-            ),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () async {
-                  await widget.onTest();
-                  refresh();
-                },
-                icon: const Icon(Icons.notifications_active_rounded),
-                label: const Text('Send test alert now'),
-              ),
-            ),
-          ],
-        );
-      },
+          ),
+        ),
+        const SizedBox(height: 16),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            key: const ValueKey('apply-alarm-settings'),
+            onPressed: saving ? null : applySettings,
+            icon: const Icon(Icons.save_outlined),
+            label: Text(saving ? 'Applying…' : 'Apply alarm settings'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () async {
+              await widget.onEnable();
+              refresh();
+            },
+            icon: const Icon(Icons.settings_rounded),
+            label: const Text('Enable required access'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () async {
+              await widget.onTest();
+              refresh();
+            },
+            icon: const Icon(Icons.notifications_active_rounded),
+            label: const Text('Send test alert now'),
+          ),
+        ),
+      ],
     ),
   );
 }
@@ -2162,101 +2404,44 @@ class _DoseAlarmPageState extends State<DoseAlarmPage> {
                 ),
               ],
               const Spacer(),
-              Dismissible(
-                key: const ValueKey('dose-alarm-slider'),
-                direction: DismissDirection.horizontal,
-                confirmDismiss: (direction) async {
-                  await finish(direction == DismissDirection.startToEnd);
-                  return false;
-                },
-                background: _slideBackground(
-                  Alignment.centerLeft,
-                  Icons.check_rounded,
-                  'Taken',
-                  Colors.green,
-                ),
-                secondaryBackground: _slideBackground(
-                  Alignment.centerRight,
-                  Icons.snooze_rounded,
-                  '10 min',
-                  violet,
-                ),
-                child: Container(
-                  height: 76,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(38),
-                  ),
-                  child: Text(
-                    working
-                        ? 'Please wait…'
-                        : '‹  Snooze     Swipe     Taken  ›',
-                    style: const TextStyle(
-                      color: Color(0xFF38243D),
-                      fontWeight: FontWeight.w800,
-                    ),
+              const Text(
+                'Choose an action to stop this alert.',
+                style: TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                height: 58,
+                child: FilledButton.icon(
+                  key: const ValueKey('dose-taken-button'),
+                  onPressed: working ? null : () => finish(true),
+                  icon: const Icon(Icons.check_rounded),
+                  label: Text(working ? 'Please wait…' : 'I took it'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    foregroundColor: rose,
                   ),
                 ),
               ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextButton.icon(
-                      onPressed: working ? null : () => finish(false),
-                      icon: const Icon(Icons.snooze_rounded),
-                      label: const Text('Remind in 10 min'),
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.white,
-                      ),
-                    ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                height: 58,
+                child: OutlinedButton.icon(
+                  key: const ValueKey('dose-snooze-button'),
+                  onPressed: working ? null : () => finish(false),
+                  icon: const Icon(Icons.snooze_rounded),
+                  label: const Text('Remind me in 10 minutes'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white54),
                   ),
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: working ? null : () => finish(true),
-                      icon: const Icon(Icons.check_rounded),
-                      label: const Text('I took it'),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: rose,
-                      ),
-                    ),
-                  ),
-                ],
+                ),
               ),
             ],
           ),
         ),
       ),
-    ),
-  );
-
-  Widget _slideBackground(
-    Alignment alignment,
-    IconData icon,
-    String label,
-    Color color,
-  ) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 26),
-    alignment: alignment,
-    decoration: BoxDecoration(
-      color: color,
-      borderRadius: BorderRadius.circular(38),
-    ),
-    child: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, color: Colors.white),
-        const SizedBox(width: 7),
-        Text(
-          label,
-          style: const TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-      ],
     ),
   );
 }

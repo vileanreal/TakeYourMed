@@ -3,7 +3,9 @@
 A calm, modern medication reminder for iOS, Android, and web. Create recurring or date-specific schedules, receive time-sensitive alerts, and keep an editable history of every taken dose.
 
 ## Highlights
-- Alarm-style, high-priority reminders with Taken and 10-minute Snooze actions
+- Alarm-style, high-priority reminders with Taken and 10-minute Snooze buttons
+- Configurable 30-second to 5-minute alert limit (1 minute by default)
+- Independent sound, vibration, and automatic full-screen alert controls
 - Several independently tracked reminder times per medication
 - Weekly recurring schedules and one-calendar multi-date selection
 - Per-dose daily check-in and historical tracking calendar
