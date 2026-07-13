@@ -119,6 +119,33 @@ void main() {
       Alerts.instance.preferences = const AlarmPreferences();
     });
 
+    test('Android uses the bundled sound on a fresh alarm channel', () {
+      Alerts.instance.preferences = const AlarmPreferences();
+      final android = Alerts.instance.details.android!;
+      final channel = Alerts.instance.androidAlarmChannel;
+      final sound = android.sound;
+
+      expect(android.channelId, 'medicine_alarms_v4_s1_v1');
+      expect(android.importance, Importance.max);
+      expect(android.audioAttributesUsage, AudioAttributesUsage.alarm);
+      expect(android.playSound, isTrue);
+      expect(sound, isA<RawResourceAndroidNotificationSound>());
+      expect(sound?.sound, Alerts.alarmSoundResource);
+      expect(android.additionalFlags, contains(4));
+      expect(channel.id, android.channelId);
+      expect(channel.importance, Importance.max);
+      expect(channel.audioAttributesUsage, AudioAttributesUsage.alarm);
+      expect(channel.sound?.sound, Alerts.alarmSoundResource);
+
+      final soundFile = File('android/app/src/main/res/raw/medicine_alarm.wav');
+      expect(soundFile.existsSync(), isTrue);
+      expect(soundFile.lengthSync(), 2646044);
+      expect(
+        File('android/app/src/main/res/raw/keep.xml').readAsStringSync(),
+        contains('@raw/medicine_alarm'),
+      );
+    });
+
     test('Taken and Snooze notification actions never launch the UI', () {
       final actions = Alerts.instance.details.android!.actions!;
       expect(actions.map((action) => action.id), ['taken', 'snooze']);
@@ -327,6 +354,38 @@ void main() {
       );
       expect(await loadResolvedAlarmAction(refresh: true), isNull);
     });
+  });
+
+  test('cold-start alarm is handled without rescheduling it away', () async {
+    final events = <String>[];
+    const response = NotificationResponse(
+      notificationResponseType: NotificationResponseType.selectedNotification,
+      id: 72,
+      payload: 'med|9|540',
+    );
+
+    await runStartupAlarmSetup(
+      initialResponse: response,
+      refreshAlarmStatus: ({required bool reschedule}) async {
+        events.add('refresh:$reschedule');
+      },
+      handleInitialResponse: (value) async {
+        events.add('handle:${value.id}');
+      },
+    );
+    expect(events, ['refresh:false', 'handle:72']);
+
+    events.clear();
+    await runStartupAlarmSetup(
+      initialResponse: null,
+      refreshAlarmStatus: ({required bool reschedule}) async {
+        events.add('refresh:$reschedule');
+      },
+      handleInitialResponse: (_) async {
+        events.add('unexpected handle');
+      },
+    );
+    expect(events, ['refresh:true']);
   });
 
   testWidgets('renders the home experience', (tester) async {
