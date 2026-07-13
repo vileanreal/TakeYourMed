@@ -1,7 +1,10 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:take_your_med/main.dart';
 
@@ -115,6 +118,215 @@ void main() {
       expect(android.additionalFlags, contains(4));
       Alerts.instance.preferences = const AlarmPreferences();
     });
+
+    test('Taken and Snooze notification actions never launch the UI', () {
+      final actions = Alerts.instance.details.android!.actions!;
+      expect(actions.map((action) => action.id), ['taken', 'snooze']);
+      expect(actions.every((action) => !action.showsUserInterface), isTrue);
+      expect(actions.every((action) => action.cancelNotification), isTrue);
+
+      final darwinActions = medicineAlarmCategories.single.actions;
+      expect(darwinActions.map((action) => action.identifier), [
+        'taken',
+        'snooze',
+      ]);
+      expect(
+        darwinActions.every(
+          (action) => !action.options.contains(
+            DarwinNotificationActionOption.foreground,
+          ),
+        ),
+        isTrue,
+      );
+    });
+  });
+
+  group('Alarm payload routing', () {
+    test('schedule refresh preserves snoozes for the same medicine', () {
+      expect(
+        shouldCancelMedicationAlarmPayload(
+          'med|9|540',
+          9,
+          includeSnoozes: false,
+        ),
+        isTrue,
+      );
+      expect(
+        shouldCancelMedicationAlarmPayload(
+          'snoozed|9|540',
+          9,
+          includeSnoozes: false,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldCancelMedicationAlarmPayload(
+          'snoozed|9|540',
+          9,
+          includeSnoozes: true,
+        ),
+        isTrue,
+      );
+
+      final payload = MedicationAlarmPayload.parse('med|9|540');
+      expect(payload?.snoozedPayload, 'snoozed|9|540');
+      expect(MedicationAlarmPayload.parse('snoozed|9|540')?.medicationId, 9);
+      expect(isSnoozedMedicationDosePayload('snoozed|9|540', 9, 540), isTrue);
+      expect(isSnoozedMedicationDosePayload('snoozed|9|1200', 9, 540), isFalse);
+      expect(isSnoozedMedicationDosePayload('med|9|540', 9, 540), isFalse);
+    });
+  });
+
+  group('Background notification actions', () {
+    test('Taken persists only the matching dose without opening UI', () async {
+      SharedPreferences.setMockInitialValues({});
+      await saveStoredMedications([
+        Medication(
+          id: 7,
+          name: 'Antibiotic',
+          times: [480, 1200],
+          recurring: true,
+          days: const [DateTime.monday],
+          dates: const [],
+        ),
+      ]);
+      final events = <String>[];
+
+      final handled = await processStoredNotificationAction(
+        const NotificationResponse(
+          notificationResponseType:
+              NotificationResponseType.selectedNotificationAction,
+          id: 81,
+          actionId: 'taken',
+          payload: 'med|7|480',
+        ),
+        now: DateTime(2026, 7, 13, 8),
+        scheduleSnooze: (payload, sourceNotificationId) async {
+          events.add('snooze');
+        },
+      );
+
+      final stored = (await loadStoredMedications(refresh: true)).single;
+      expect(handled, isTrue);
+      expect(stored.isTaken('2026-07-13', 480), isTrue);
+      expect(stored.isTaken('2026-07-13', 1200), isFalse);
+      expect(events, isEmpty);
+    });
+
+    test(
+      'Snooze stays untaken and schedules one same-alarm reminder',
+      () async {
+        SharedPreferences.setMockInitialValues({});
+        await saveStoredMedications([
+          Medication(
+            id: 9,
+            name: 'Vitamin C',
+            times: [540],
+            recurring: true,
+            days: const [DateTime.monday],
+            dates: const [],
+          ),
+        ]);
+        final events = <String>[];
+
+        final handled = await processStoredNotificationAction(
+          const NotificationResponse(
+            notificationResponseType:
+                NotificationResponseType.selectedNotificationAction,
+            id: 42,
+            actionId: 'snooze',
+            payload: 'med|9|540',
+          ),
+          now: DateTime(2026, 7, 13, 9),
+          scheduleSnooze: (payload, sourceNotificationId) async {
+            events.add('snooze:$payload:$sourceNotificationId');
+          },
+        );
+
+        final stored = (await loadStoredMedications(refresh: true)).single;
+        expect(handled, isTrue);
+        expect(stored.isTaken('2026-07-13', 540), isFalse);
+        expect(events, ['snooze:med|9|540:42']);
+      },
+    );
+
+    test('ignores malformed actions without scheduling anything', () async {
+      SharedPreferences.setMockInitialValues({});
+      var calls = 0;
+      final handled = await processStoredNotificationAction(
+        const NotificationResponse(
+          notificationResponseType:
+              NotificationResponseType.selectedNotificationAction,
+          id: 1,
+          actionId: 'taken',
+          payload: 'not-a-dose',
+        ),
+        scheduleSnooze: (_, _) async => calls++,
+      );
+      expect(handled, isFalse);
+      expect(calls, 0);
+    });
+
+    test('handles Taken from a snoozed reminder', () async {
+      SharedPreferences.setMockInitialValues({});
+      await saveStoredMedications([
+        Medication(
+          id: 9,
+          name: 'Vitamin C',
+          times: [540],
+          recurring: true,
+          days: const [DateTime.monday],
+          dates: const [],
+        ),
+      ]);
+
+      final handled = await processStoredNotificationAction(
+        const NotificationResponse(
+          notificationResponseType:
+              NotificationResponseType.selectedNotificationAction,
+          id: 43,
+          actionId: 'taken',
+          payload: 'snoozed|9|540',
+        ),
+        now: DateTime(2026, 7, 13, 9, 10),
+        scheduleSnooze: (_, _) async {},
+      );
+
+      final stored = (await loadStoredMedications(refresh: true)).single;
+      expect(handled, isTrue);
+      expect(stored.isTaken('2026-07-13', 540), isTrue);
+    });
+
+    test('does not mark a failed Snooze as resolved', () async {
+      SharedPreferences.setMockInitialValues({});
+      await saveStoredMedications([
+        Medication(
+          id: 9,
+          name: 'Vitamin C',
+          times: [540],
+          recurring: true,
+          days: const [DateTime.monday],
+          dates: const [],
+        ),
+      ]);
+      const response = NotificationResponse(
+        notificationResponseType:
+            NotificationResponseType.selectedNotificationAction,
+        id: 44,
+        actionId: 'snooze',
+        payload: 'med|9|540',
+      );
+
+      await expectLater(
+        processAndRecordStoredNotificationAction(
+          response,
+          scheduleSnooze: (_, _) =>
+              Future<void>.error(StateError('Could not schedule snooze')),
+        ),
+        throwsStateError,
+      );
+      expect(await loadResolvedAlarmAction(refresh: true), isNull);
+    });
   });
 
   testWidgets('renders the home experience', (tester) async {
@@ -183,6 +395,145 @@ void main() {
     expect(taken, isTrue);
   });
 
+  testWidgets('background action dismisses an already-visible alarm host', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var hostDismissed = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: FilledButton(
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => DoseAlarmPage(
+                    medicineName: 'Vitamin C',
+                    instructions: '',
+                    onTaken: () async {},
+                    onSnooze: () async {},
+                    dismissHost: () async {
+                      hostDismissed = true;
+                      return true;
+                    },
+                    alarmPayload: 'med|9|540',
+                    notificationId: 42,
+                  ),
+                ),
+              ),
+              child: const Text('Home sentinel'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Home sentinel'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await recordResolvedAlarmAction(
+      const NotificationResponse(
+        notificationResponseType:
+            NotificationResponseType.selectedNotificationAction,
+        id: 42,
+        actionId: 'snooze',
+        payload: 'med|9|540',
+      ),
+    );
+    await tester.pump(const Duration(seconds: 1));
+    expect(hostDismissed, isTrue);
+    expect(find.text('Home sentinel'), findsNothing);
+    expect(find.text('Vitamin C'), findsOneWidget);
+  });
+
+  testWidgets('alarm still dismisses when its action callback fails', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var hostDismissed = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DoseAlarmPage(
+          medicineName: 'Vitamin C',
+          instructions: '',
+          onTaken: () async => throw StateError('storage unavailable'),
+          onSnooze: () async {},
+          dismissHost: () async {
+            hostDismissed = true;
+            return true;
+          },
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('dose-taken-button')));
+    await tester.pumpAndSettle();
+    expect(hostDismissed, isTrue);
+  });
+
+  testWidgets('alarm returns to Home when Take Your Med was already open', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: FilledButton(
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => DoseAlarmPage(
+                    medicineName: 'Vitamin C',
+                    instructions: '',
+                    onTaken: () async {},
+                    onSnooze: () async {},
+                    dismissHost: () async => false,
+                  ),
+                ),
+              ),
+              child: const Text('Home sentinel'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Home sentinel'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('dose-taken-button')));
+    await tester.pumpAndSettle();
+    expect(find.text('Home sentinel'), findsOneWidget);
+  });
+
+  testWidgets('Android alarm host dismissal delegates to the native host', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    MethodCall? platformCall;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(alarmHostChannel, (call) async {
+      platformCall = call;
+      return true;
+    });
+    try {
+      expect(await dismissAlarmHost(), isTrue);
+      expect(platformCall?.method, 'dismissAlarmHost');
+      expect(platformCall?.arguments, isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+      messenger.setMockMethodCallHandler(alarmHostChannel, null);
+    }
+  });
+
   testWidgets('alarm check exposes duration and behavior controls', (
     tester,
   ) async {
@@ -227,5 +578,15 @@ void main() {
     expect(manifest, contains('ActionBroadcastReceiver'));
     expect(manifest, contains('android:showWhenLocked="true"'));
     expect(manifest, contains('android:turnScreenOn="true"'));
+
+    final activity = File(
+      'android/app/src/main/kotlin/com/vileanreal/take_your_med/MainActivity.kt',
+    ).readAsStringSync();
+    expect(activity, contains('take_your_med/alarm_host'));
+    expect(activity, contains('SELECT_NOTIFICATION'));
+    expect(activity, contains('finishAndRemoveTask()'));
+
+    final appDelegate = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+    expect(appDelegate, contains('setPluginRegistrantCallback'));
   });
 }
