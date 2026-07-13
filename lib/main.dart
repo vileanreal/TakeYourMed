@@ -1,7 +1,9 @@
 // Take Your Med — local-first medication reminders for mobile and web.
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:intl/intl.dart';
@@ -96,6 +98,321 @@ class Medication {
   }
 }
 
+const _takenActionPrefix = 'backgroundTakenAction.';
+const _resolvedAlarmActionKey = 'lastResolvedAlarmAction';
+
+class MedicationAlarmPayload {
+  const MedicationAlarmPayload({
+    required this.medicationId,
+    required this.minutes,
+    required this.isSnoozed,
+  });
+
+  final int medicationId;
+  final int minutes;
+  final bool isSnoozed;
+
+  static MedicationAlarmPayload? parse(String payload) {
+    final parts = payload.split('|');
+    if (parts.length != 3 ||
+        (parts.first != 'med' && parts.first != 'snoozed')) {
+      return null;
+    }
+    final medicationId = int.tryParse(parts[1]);
+    final minutes = int.tryParse(parts[2]);
+    if (medicationId == null || minutes == null) return null;
+    return MedicationAlarmPayload(
+      medicationId: medicationId,
+      minutes: minutes,
+      isSnoozed: parts.first == 'snoozed',
+    );
+  }
+
+  String get snoozedPayload => 'snoozed|$medicationId|$minutes';
+}
+
+@visibleForTesting
+bool shouldCancelMedicationAlarmPayload(
+  String? payload,
+  int medicationId, {
+  required bool includeSnoozes,
+}) {
+  if (payload == null) return false;
+  final parsed = MedicationAlarmPayload.parse(payload);
+  return parsed != null &&
+      parsed.medicationId == medicationId &&
+      (includeSnoozes || !parsed.isSnoozed);
+}
+
+@visibleForTesting
+bool isSnoozedMedicationDosePayload(
+  String? payload,
+  int medicationId,
+  int minutes,
+) {
+  if (payload == null) return false;
+  final parsed = MedicationAlarmPayload.parse(payload);
+  return parsed != null &&
+      parsed.isSnoozed &&
+      parsed.medicationId == medicationId &&
+      parsed.minutes == minutes;
+}
+
+Set<String> _applyPendingTakenActions(
+  SharedPreferences preferences,
+  List<Medication> medications,
+) {
+  final appliedKeys = <String>{};
+  for (final key in preferences.getKeys().where(
+    (value) => value.startsWith(_takenActionPrefix),
+  )) {
+    final parts = key.substring(_takenActionPrefix.length).split('|');
+    if (parts.length == 3) {
+      final medicationId = int.tryParse(parts[0]);
+      final minutes = int.tryParse(parts[2]);
+      final medication = medications
+          .where((item) => item.id == medicationId)
+          .firstOrNull;
+      if (medication != null &&
+          minutes != null &&
+          medication.times.contains(minutes)) {
+        medication.setTaken(parts[1], minutes, true);
+      }
+    }
+    appliedKeys.add(key);
+  }
+  return appliedKeys;
+}
+
+Future<void> _clearAppliedTakenActions(
+  SharedPreferences preferences,
+  Set<String> keys,
+) async {
+  for (final key in keys) {
+    await preferences.remove(key);
+  }
+}
+
+Future<List<Medication>> loadStoredMedications({
+  bool refresh = false,
+  bool applyPendingActions = true,
+}) async {
+  final preferences = await SharedPreferences.getInstance();
+  if (refresh) await preferences.reload();
+  final raw = preferences.getString('medications');
+  if (raw == null) return [];
+  final medications = (jsonDecode(raw) as List)
+      .map((value) => Medication.fromJson(value))
+      .toList();
+  final appliedKeys = applyPendingActions
+      ? _applyPendingTakenActions(preferences, medications)
+      : <String>{};
+  if (appliedKeys.isNotEmpty) {
+    await preferences.setString(
+      'medications',
+      jsonEncode(medications.map((medication) => medication.toJson()).toList()),
+    );
+    await _clearAppliedTakenActions(preferences, appliedKeys);
+  }
+  return medications;
+}
+
+Future<void> saveStoredMedications(List<Medication> medications) async {
+  final preferences = await SharedPreferences.getInstance();
+  await preferences.reload();
+  final appliedKeys = _applyPendingTakenActions(preferences, medications);
+  await preferences.setString(
+    'medications',
+    jsonEncode(medications.map((medication) => medication.toJson()).toList()),
+  );
+  await _clearAppliedTakenActions(preferences, appliedKeys);
+}
+
+typedef ScheduleSnooze =
+    Future<void> Function(String payload, int? sourceNotificationId);
+
+Future<void> _recordPendingTakenAction(
+  int medicationId,
+  String date,
+  int minutes,
+) async {
+  final preferences = await SharedPreferences.getInstance();
+  await preferences.setBool(
+    '$_takenActionPrefix$medicationId|$date|$minutes',
+    true,
+  );
+}
+
+class ResolvedAlarmAction {
+  const ResolvedAlarmAction({
+    required this.payload,
+    required this.notificationId,
+    required this.completedAtMillis,
+  });
+  final String payload;
+  final int? notificationId;
+  final int completedAtMillis;
+}
+
+Future<void> recordResolvedAlarmAction(NotificationResponse response) async {
+  if (response.actionId != 'taken' && response.actionId != 'snooze') return;
+  final preferences = await SharedPreferences.getInstance();
+  await preferences.setString(
+    _resolvedAlarmActionKey,
+    jsonEncode({
+      'payload': response.payload ?? '',
+      'notificationId': response.id,
+      'completedAtMillis': DateTime.now().millisecondsSinceEpoch,
+    }),
+  );
+}
+
+Future<ResolvedAlarmAction?> loadResolvedAlarmAction({
+  bool refresh = false,
+}) async {
+  final preferences = await SharedPreferences.getInstance();
+  if (refresh) await preferences.reload();
+  final raw = preferences.getString(_resolvedAlarmActionKey);
+  if (raw == null) return null;
+  try {
+    final value = jsonDecode(raw) as Map<String, dynamic>;
+    return ResolvedAlarmAction(
+      payload: value['payload'] as String? ?? '',
+      notificationId: (value['notificationId'] as num?)?.toInt(),
+      completedAtMillis: (value['completedAtMillis'] as num?)?.toInt() ?? 0,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<bool> wasAlarmResolvedRecently({
+  required String payload,
+  required int? notificationId,
+  required DateTime since,
+}) async {
+  final action = await loadResolvedAlarmAction(refresh: true);
+  if (action == null || action.payload != payload) return false;
+  if (notificationId != null &&
+      action.notificationId != null &&
+      action.notificationId != notificationId) {
+    return false;
+  }
+  return action.completedAtMillis >= since.millisecondsSinceEpoch;
+}
+
+@visibleForTesting
+Future<bool> processStoredNotificationAction(
+  NotificationResponse response, {
+  DateTime? now,
+  required ScheduleSnooze scheduleSnooze,
+}) async {
+  if (response.actionId != 'taken' && response.actionId != 'snooze') {
+    return false;
+  }
+  final payload = response.payload ?? '';
+  if (payload == 'test') {
+    if (response.actionId == 'snooze') {
+      await scheduleSnooze(payload, response.id);
+    }
+    return true;
+  }
+  final dose = MedicationAlarmPayload.parse(payload);
+  if (dose == null) return false;
+
+  final medications = await loadStoredMedications(
+    refresh: true,
+    applyPendingActions: false,
+  );
+  final medication = medications
+      .where((item) => item.id == dose.medicationId)
+      .firstOrNull;
+  if (medication == null || !medication.times.contains(dose.minutes)) {
+    return false;
+  }
+
+  if (response.actionId == 'taken') {
+    await _recordPendingTakenAction(
+      medication.id,
+      Medication.dateKey(now ?? DateTime.now()),
+      dose.minutes,
+    );
+  } else {
+    await scheduleSnooze(payload, response.id);
+  }
+  return true;
+}
+
+@visibleForTesting
+Future<bool> processAndRecordStoredNotificationAction(
+  NotificationResponse response, {
+  DateTime? now,
+  required ScheduleSnooze scheduleSnooze,
+}) async {
+  final handled = await processStoredNotificationAction(
+    response,
+    now: now,
+    scheduleSnooze: scheduleSnooze,
+  );
+  if (handled) await recordResolvedAlarmAction(response);
+  return handled;
+}
+
+Future<void> _backgroundActionQueue = Future.value();
+
+@pragma('vm:entry-point')
+void notificationTapBackground(NotificationResponse response) {
+  _backgroundActionQueue = _backgroundActionQueue.then((_) async {
+    try {
+      WidgetsFlutterBinding.ensureInitialized();
+      await processAndRecordStoredNotificationAction(
+        response,
+        scheduleSnooze: (payload, sourceNotificationId) async {
+          await Alerts.instance.init(captureLaunchDetails: false);
+          await Alerts.instance.reloadPreferences();
+          await Alerts.instance.snooze(
+            payload,
+            sourceNotificationId: sourceNotificationId,
+          );
+        },
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Could not process notification action: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+  });
+}
+
+const alarmHostChannel = MethodChannel('take_your_med/alarm_host');
+
+Future<bool> dismissAlarmHost() async {
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    try {
+      final dismissed = await alarmHostChannel.invokeMethod<bool>(
+        'dismissAlarmHost',
+      );
+      if (dismissed != null) return dismissed;
+    } on PlatformException catch (error) {
+      debugPrint('Native alarm host dismissal was unavailable: $error');
+    } on MissingPluginException catch (error) {
+      debugPrint('Native alarm host bridge was unavailable: $error');
+    }
+    await SystemNavigator.pop(animated: true);
+    return true;
+  }
+  return false;
+}
+
+List<DarwinNotificationCategory> get medicineAlarmCategories => [
+  DarwinNotificationCategory(
+    'medicine_alarm',
+    actions: [
+      DarwinNotificationAction.plain('taken', 'Taken'),
+      DarwinNotificationAction.plain('snooze', 'Remind me later'),
+    ],
+  ),
+];
+
 class AlarmPreferences {
   const AlarmPreferences({
     this.durationSeconds = 60,
@@ -118,8 +435,9 @@ class AlarmPreferences {
     autoDisplay: autoDisplay ?? this.autoDisplay,
   );
 
-  static Future<AlarmPreferences> load() async {
+  static Future<AlarmPreferences> load({bool refresh = false}) async {
     final prefs = await SharedPreferences.getInstance();
+    if (refresh) await prefs.reload();
     final storedDuration = prefs.getInt('alarmDurationSeconds') ?? 60;
     final duration = const [30, 60, 120, 300].contains(storedDuration)
         ? storedDuration
@@ -165,7 +483,8 @@ class Alerts {
         AndroidFlutterLocalNotificationsPlugin
       >();
 
-  Future<void> init() async {
+  Future<void> init({bool captureLaunchDetails = true}) async {
+    if (initialized) return;
     preferences = await AlarmPreferences.load();
     tz_data.initializeTimeZones();
     if (!kIsWeb) {
@@ -178,39 +497,25 @@ class Alerts {
       }
     }
     const a = AndroidInitializationSettings('notification_icon');
-    final categories = <DarwinNotificationCategory>[
-      DarwinNotificationCategory(
-        'medicine_alarm',
-        actions: [
-          DarwinNotificationAction.plain(
-            'taken',
-            'Taken',
-            options: {DarwinNotificationActionOption.foreground},
-          ),
-          DarwinNotificationAction.plain(
-            'snooze',
-            'Remind me later',
-            options: {DarwinNotificationActionOption.foreground},
-          ),
-        ],
-      ),
-    ];
     final i = DarwinInitializationSettings(
       requestAlertPermission: false,
       requestBadgePermission: false,
       requestSoundPermission: false,
-      notificationCategories: categories,
+      notificationCategories: medicineAlarmCategories,
     );
     await plugin.initialize(
       settings: InitializationSettings(android: a, iOS: i, macOS: i),
       onDidReceiveNotificationResponse: (response) {
         responses.value = response;
       },
+      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
     );
     initialized = true;
-    final launch = await plugin.getNotificationAppLaunchDetails();
-    if (launch?.didNotificationLaunchApp ?? false) {
-      initialResponse = launch?.notificationResponse;
+    if (captureLaunchDetails) {
+      final launch = await plugin.getNotificationAppLaunchDetails();
+      if (launch?.didNotificationLaunchApp ?? false) {
+        initialResponse = launch?.notificationResponse;
+      }
     }
   }
 
@@ -240,11 +545,17 @@ class Alerts {
           ? Int32List.fromList([4])
           : null,
       actions: const [
-        AndroidNotificationAction('taken', 'Taken', showsUserInterface: true),
+        AndroidNotificationAction(
+          'taken',
+          'Taken',
+          showsUserInterface: false,
+          cancelNotification: true,
+        ),
         AndroidNotificationAction(
           'snooze',
           'Remind me in 10 min',
-          showsUserInterface: true,
+          showsUserInterface: false,
+          cancelNotification: true,
         ),
       ],
     ),
@@ -262,6 +573,10 @@ class Alerts {
     if (!kIsWeb && value.autoDisplay) {
       await _android?.requestFullScreenIntentPermission();
     }
+  }
+
+  Future<void> reloadPreferences() async {
+    preferences = await AlarmPreferences.load(refresh: true);
   }
 
   Future<AlertStatus> status() async {
@@ -299,8 +614,11 @@ class Alerts {
 
   Future<void> schedule(Medication m) async {
     if (!initialized) return;
-    await cancel(m.id);
-    if (m.finished) return;
+    if (m.finished) {
+      await cancel(m.id);
+      return;
+    }
+    await _cancelBaseSchedule(m.id);
     final exact = await _android?.canScheduleExactNotifications() ?? true;
     final mode = exact
         ? AndroidScheduleMode.exactAllowWhileIdle
@@ -378,19 +696,49 @@ class Alerts {
     return hash;
   }
 
-  Future<void> cancel(int id) async {
+  Future<void> _cancelBaseSchedule(int id) =>
+      _cancelMedicationAlarms(id, includeSnoozes: false);
+
+  Future<void> cancel(int id) =>
+      _cancelMedicationAlarms(id, includeSnoozes: true);
+
+  Future<void> _cancelMedicationAlarms(
+    int id, {
+    required bool includeSnoozes,
+  }) async {
     final pending = await plugin.pendingNotificationRequests();
     for (final request in pending) {
-      if (request.payload?.startsWith('med|$id|') ?? false) {
+      if (shouldCancelMedicationAlarmPayload(
+        request.payload,
+        id,
+        includeSnoozes: includeSnoozes,
+      )) {
         await plugin.cancel(id: request.id);
       }
     }
   }
 
-  Future<void> snooze(String payload) async {
+  Future<void> cancelSnoozedDose(int medicationId, int minutes) async {
+    final pending = await plugin.pendingNotificationRequests();
+    for (final request in pending) {
+      if (isSnoozedMedicationDosePayload(
+        request.payload,
+        medicationId,
+        minutes,
+      )) {
+        await plugin.cancel(id: request.id);
+      }
+    }
+  }
+
+  Future<void> snooze(String payload, {int? sourceNotificationId}) async {
     final exact = await _android?.canScheduleExactNotifications() ?? true;
+    final snoozedPayload =
+        MedicationAlarmPayload.parse(payload)?.snoozedPayload ?? payload;
+    final snoozeSource =
+        sourceNotificationId ?? DateTime.now().millisecondsSinceEpoch;
     await plugin.zonedSchedule(
-      id: _id('$payload|snooze|${DateTime.now().millisecondsSinceEpoch}'),
+      id: _id('$snoozedPayload|snooze|$snoozeSource'),
       title: 'Medication reminder',
       body: 'Your 10-minute snooze is over',
       scheduledDate: tz.TZDateTime.now(
@@ -400,7 +748,7 @@ class Alerts {
       androidScheduleMode: exact
           ? AndroidScheduleMode.exactAllowWhileIdle
           : AndroidScheduleMode.inexactAllowWhileIdle,
-      payload: payload,
+      payload: snoozedPayload,
     );
   }
 
@@ -495,6 +843,7 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   List<Medication> meds = [];
   bool loaded = false;
   AlertStatus? alertStatus;
+  int lastResolvedAlarmAt = 0;
   String get today => DateFormat('yyyy-MM-dd').format(DateTime.now());
   @override
   void initState() {
@@ -514,16 +863,19 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _refreshAlertStatus();
+      if (loaded) {
+        _reloadAfterBackgroundAction();
+      } else {
+        _refreshAlertStatus();
+      }
     }
   }
 
   Future<void> load() async {
+    meds = await loadStoredMedications(refresh: true);
+    lastResolvedAlarmAt =
+        (await loadResolvedAlarmAction())?.completedAtMillis ?? 0;
     final p = await SharedPreferences.getInstance();
-    final raw = p.getString('medications');
-    meds = raw == null
-        ? []
-        : (jsonDecode(raw) as List).map((e) => Medication.fromJson(e)).toList();
     final welcomed = p.getBool('welcomed') ?? false;
     if (mounted) {
       setState(() => loaded = true);
@@ -538,6 +890,38 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
           _handleNotification(initial);
         }
       });
+    }
+  }
+
+  Future<void> _reloadAfterBackgroundAction() async {
+    try {
+      final resolved = await loadResolvedAlarmAction(refresh: true);
+      if (resolved == null ||
+          resolved.completedAtMillis <= lastResolvedAlarmAt) {
+        await _refreshAlertStatus();
+        return;
+      }
+      lastResolvedAlarmAt = resolved.completedAtMillis;
+      final stored = await loadStoredMedications();
+      if (!mounted) return;
+      setState(() {
+        for (final storedMedication in stored) {
+          final current = meds
+              .where((item) => item.id == storedMedication.id)
+              .firstOrNull;
+          if (current == null) {
+            meds.add(storedMedication);
+          } else {
+            current.taken = {
+              ...current.taken,
+              ...storedMedication.taken,
+            }.toList()..sort();
+          }
+        }
+      });
+      await _refreshAlertStatus();
+    } catch (error) {
+      debugPrint('Could not refresh medication actions: $error');
     }
   }
 
@@ -582,23 +966,33 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
       );
       return;
     }
-    final parts = payload.split('|');
-    if (parts.length != 3 || parts.first != 'med') return;
-    final medId = int.tryParse(parts[1]);
-    final minutes = int.tryParse(parts[2]);
-    final med = meds.where((m) => m.id == medId).firstOrNull;
-    if (med == null || minutes == null) return;
+    final dose = MedicationAlarmPayload.parse(payload);
+    if (!(response.actionId?.isNotEmpty ?? false) &&
+        dose != null &&
+        await wasAlarmResolvedRecently(
+          payload: payload,
+          notificationId: response.id,
+          since: DateTime.now().subtract(const Duration(seconds: 30)),
+        )) {
+      await dismissAlarmHost();
+      return;
+    }
+    if (dose == null) return;
+    final med = meds.where((m) => m.id == dose.medicationId).firstOrNull;
+    if (med == null || !med.times.contains(dose.minutes)) return;
     if (response.actionId == 'taken') {
-      await _completeDose(med, minutes, response.id);
+      await _completeDose(med, dose.minutes, response.id);
+      await dismissAlarmHost();
     } else if (response.actionId == 'snooze') {
-      await _snooze(payload, response.id);
+      await _snooze(payload, response.id, showConfirmation: false);
+      await dismissAlarmHost();
     } else {
       await _openAlarm(
         name: med.name,
         instructions: med.notes,
         payload: payload,
         notificationId: response.id,
-        onTaken: () => _completeDose(med, minutes, response.id),
+        onTaken: () => _completeDose(med, dose.minutes, response.id),
       );
     }
   }
@@ -608,26 +1002,30 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
     int minutes,
     int? notificationId,
   ) async {
+    await _setDoseTaken(med, today, minutes, true);
     if (notificationId != null) {
       await Alerts.instance.plugin.cancel(id: notificationId);
     }
-    setState(() => med.setTaken(today, minutes, true));
-    await save();
     await Alerts.instance.schedule(med);
   }
 
-  Future<void> _snooze(String payload, int? notificationId) async {
+  Future<void> _snooze(
+    String payload,
+    int? notificationId, {
+    bool showConfirmation = true,
+  }) async {
     if (notificationId != null) {
       await Alerts.instance.plugin.cancel(id: notificationId);
     }
-    final parts = payload.split('|');
-    if (parts.length == 3 && parts.first == 'med') {
-      final medId = int.tryParse(parts[1]);
-      final med = meds.where((item) => item.id == medId).firstOrNull;
+    final dose = MedicationAlarmPayload.parse(payload);
+    if (dose != null) {
+      final med = meds
+          .where((item) => item.id == dose.medicationId)
+          .firstOrNull;
       if (med != null) await Alerts.instance.schedule(med);
     }
-    await Alerts.instance.snooze(payload);
-    if (mounted) {
+    await Alerts.instance.snooze(payload, sourceNotificationId: notificationId);
+    if (mounted && showConfirmation) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('We’ll remind you again in 10 minutes.')),
       );
@@ -654,17 +1052,38 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
               await Alerts.instance.plugin.cancel(id: notificationId);
             }
           },
-          onSnooze: () => _snooze(payload, notificationId),
+          onSnooze: () =>
+              _snooze(payload, notificationId, showConfirmation: false),
+          dismissHost: MedicationAlarmPayload.parse(payload) != null
+              ? dismissAlarmHost
+              : null,
+          alarmPayload: payload,
+          notificationId: notificationId,
+          onBackgroundResolved: _reloadAfterBackgroundAction,
         ),
       ),
     );
   }
 
-  Future<void> save() async =>
-      (await SharedPreferences.getInstance()).setString(
-        'medications',
-        jsonEncode(meds.map((m) => m.toJson()).toList()),
-      );
+  Future<void> save() => saveStoredMedications(meds);
+
+  Future<void> _setDoseTaken(
+    Medication med,
+    String date,
+    int minutes,
+    bool value,
+  ) async {
+    if (mounted) setState(() => med.setTaken(date, minutes, value));
+    await save();
+    if (value && date == today) {
+      try {
+        await Alerts.instance.cancelSnoozedDose(med.id, minutes);
+      } catch (error) {
+        debugPrint('Could not cancel the completed dose snooze: $error');
+      }
+    }
+  }
+
   Future<void> welcome() async {
     await showDialog(
       context: context,
@@ -851,12 +1270,14 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
                           itemBuilder: (_, i) => MedCard(
                             med: active[i],
                             today: today,
-                            toggle: (minutes) {
+                            toggle: (minutes) async {
                               final current = active[i].isTaken(today, minutes);
-                              setState(() {
-                                active[i].setTaken(today, minutes, !current);
-                              });
-                              save();
+                              await _setDoseTaken(
+                                active[i],
+                                today,
+                                minutes,
+                                !current,
+                              );
                             },
                             edit: () => edit(active[i]),
                             history: () => history(active[i]),
@@ -899,6 +1320,7 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> edit([Medication? m]) async {
+    final previousTimes = {...?m?.times};
     final r = await showModalBottomSheet<Medication>(
       context: context,
       isScrollControlled: true,
@@ -915,6 +1337,9 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
         await _enableAlerts();
       }
       try {
+        for (final removedTime in previousTimes.difference(r.times.toSet())) {
+          await Alerts.instance.cancelSnoozedDose(r.id, removedTime);
+        }
         await Alerts.instance.schedule(r);
         await _refreshAlertStatus();
       } catch (error) {
@@ -1034,10 +1459,7 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
     useSafeArea: true,
     builder: (_) => History(
       med: m,
-      changed: () {
-        setState(() {});
-        save();
-      },
+      changed: (date, minutes, value) => _setDoseTaken(m, date, minutes, value),
     ),
   );
   Future<void> finished() async => showModalBottomSheet(
@@ -1213,7 +1635,7 @@ class MedCard extends StatelessWidget {
   });
   final Medication med;
   final String today;
-  final ValueChanged<int> toggle;
+  final Future<void> Function(int minutes) toggle;
   final VoidCallback edit, history, delete;
   @override
   Widget build(BuildContext c) {
@@ -1295,7 +1717,7 @@ class MedCard extends StatelessWidget {
                     fontWeight: FontWeight.w700,
                     color: checked ? Colors.white : null,
                   ),
-                  onSelected: (_) => toggle(minutes),
+                  onSelected: (_) => unawaited(toggle(minutes)),
                 );
               }).toList(),
             ),
@@ -1586,7 +2008,7 @@ class _EditorState extends State<Editor> {
 class History extends StatefulWidget {
   const History({super.key, required this.med, required this.changed});
   final Medication med;
-  final VoidCallback changed;
+  final Future<void> Function(String date, int minutes, bool value) changed;
   @override
   State<History> createState() => _HistoryState();
 }
@@ -1690,10 +2112,8 @@ class _HistoryState extends State<History> {
                 final count = widget.med.takenCount(key);
                 return InkWell(
                   onTap: () {
-                    setState(
-                      () => widget.med.setTaken(key, selectedTime, !yes),
-                    );
-                    widget.changed();
+                    unawaited(widget.changed(key, selectedTime, !yes));
+                    setState(() {});
                   },
                   child: Container(
                     alignment: Alignment.center,
@@ -2329,116 +2749,216 @@ class DoseAlarmPage extends StatefulWidget {
     required this.instructions,
     required this.onTaken,
     required this.onSnooze,
+    this.dismissHost,
+    this.alarmPayload,
+    this.notificationId,
+    this.onBackgroundResolved,
   });
   final String medicineName, instructions;
   final Future<void> Function() onTaken, onSnooze;
+  final Future<bool> Function()? dismissHost;
+  final String? alarmPayload;
+  final int? notificationId;
+  final Future<void> Function()? onBackgroundResolved;
   @override
   State<DoseAlarmPage> createState() => _DoseAlarmPageState();
 }
 
-class _DoseAlarmPageState extends State<DoseAlarmPage> {
-  bool working = false;
-  Future<void> finish(bool taken) async {
-    if (working) return;
-    setState(() => working = true);
-    taken ? await widget.onTaken() : await widget.onSnooze();
-    if (mounted) Navigator.pop(context);
+class _DoseAlarmPageState extends State<DoseAlarmPage>
+    with WidgetsBindingObserver {
+  bool working = false, allowPop = false;
+  bool checkingResolution = false, dismissalStarted = false;
+  Timer? resolutionTimer;
+  late final DateTime openedAt;
+
+  @override
+  void initState() {
+    super.initState();
+    openedAt = DateTime.now();
+    WidgetsBinding.instance.addObserver(this);
+    _startResolutionChecks();
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    body: Container(
-      width: double.infinity,
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFF381B3D), Color(0xFFB63368), Color(0xFF6D5AE8)],
+  void dispose() {
+    resolutionTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _startResolutionChecks();
+  }
+
+  void _startResolutionChecks() {
+    if (widget.dismissHost == null ||
+        widget.alarmPayload == null ||
+        dismissalStarted) {
+      return;
+    }
+    resolutionTimer?.cancel();
+    var remainingChecks = 20;
+    unawaited(_checkForBackgroundResolution());
+    resolutionTimer = Timer.periodic(const Duration(milliseconds: 250), (
+      timer,
+    ) {
+      if (--remainingChecks <= 0 || dismissalStarted) {
+        timer.cancel();
+      } else {
+        unawaited(_checkForBackgroundResolution());
+      }
+    });
+  }
+
+  Future<void> _checkForBackgroundResolution() async {
+    if (checkingResolution || dismissalStarted) return;
+    checkingResolution = true;
+    try {
+      final resolved = await wasAlarmResolvedRecently(
+        payload: widget.alarmPayload!,
+        notificationId: widget.notificationId,
+        since: openedAt.subtract(const Duration(seconds: 30)),
+      );
+      if (resolved && mounted) {
+        dismissalStarted = true;
+        resolutionTimer?.cancel();
+        await widget.onBackgroundResolved?.call();
+        await _dismissAlarm();
+      }
+    } catch (error) {
+      debugPrint('Could not check resolved alarm state: $error');
+    } finally {
+      checkingResolution = false;
+    }
+  }
+
+  Future<void> _dismissAlarm() async {
+    var hostDismissed = false;
+    try {
+      hostDismissed = await widget.dismissHost?.call() ?? false;
+    } catch (error) {
+      debugPrint('Could not dismiss the alarm host: $error');
+    }
+    if (mounted && !hostDismissed) {
+      setState(() => allowPop = true);
+      Navigator.pop(context);
+    }
+  }
+
+  Future<void> finish(bool taken) async {
+    if (working) return;
+    setState(() {
+      working = true;
+      dismissalStarted = true;
+    });
+    resolutionTimer?.cancel();
+    try {
+      taken ? await widget.onTaken() : await widget.onSnooze();
+    } catch (error) {
+      debugPrint('Could not finish alarm action: $error');
+    } finally {
+      if (mounted) await _dismissAlarm();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+    canPop: allowPop,
+    child: Scaffold(
+      body: Container(
+        width: double.infinity,
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF381B3D), Color(0xFFB63368), Color(0xFF6D5AE8)],
+          ),
         ),
-      ),
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: Column(
-            children: [
-              const Spacer(),
-              Container(
-                width: 108,
-                height: 108,
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: .16),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white24, width: 2),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(28),
+            child: Column(
+              children: [
+                const Spacer(),
+                Container(
+                  width: 108,
+                  height: 108,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: .16),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white24, width: 2),
+                  ),
+                  child: const Icon(
+                    Icons.medication_rounded,
+                    size: 54,
+                    color: Colors.white,
+                  ),
                 ),
-                child: const Icon(
-                  Icons.medication_rounded,
-                  size: 54,
-                  color: Colors.white,
+                const SizedBox(height: 26),
+                const Text(
+                  'TIME FOR YOUR MEDICINE',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.4,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 26),
-              const Text(
-                'TIME FOR YOUR MEDICINE',
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1.4,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                widget.medicineName,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 34,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              if (widget.instructions.isNotEmpty) ...[
-                const SizedBox(height: 10),
+                const SizedBox(height: 8),
                 Text(
-                  widget.instructions,
+                  widget.medicineName,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white70, fontSize: 17),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 34,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                if (widget.instructions.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    widget.instructions,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white70, fontSize: 17),
+                  ),
+                ],
+                const Spacer(),
+                const Text(
+                  'Choose an action to stop this alert.',
+                  style: TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  height: 58,
+                  child: FilledButton.icon(
+                    key: const ValueKey('dose-taken-button'),
+                    onPressed: working ? null : () => finish(true),
+                    icon: const Icon(Icons.check_rounded),
+                    label: Text(working ? 'Please wait…' : 'I took it'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: rose,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 58,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('dose-snooze-button'),
+                    onPressed: working ? null : () => finish(false),
+                    icon: const Icon(Icons.snooze_rounded),
+                    label: const Text('Remind me in 10 minutes'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white54),
+                    ),
+                  ),
                 ),
               ],
-              const Spacer(),
-              const Text(
-                'Choose an action to stop this alert.',
-                style: TextStyle(color: Colors.white70),
-              ),
-              const SizedBox(height: 16),
-              SizedBox(
-                width: double.infinity,
-                height: 58,
-                child: FilledButton.icon(
-                  key: const ValueKey('dose-taken-button'),
-                  onPressed: working ? null : () => finish(true),
-                  icon: const Icon(Icons.check_rounded),
-                  label: Text(working ? 'Please wait…' : 'I took it'),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: Colors.white,
-                    foregroundColor: rose,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                height: 58,
-                child: OutlinedButton.icon(
-                  key: const ValueKey('dose-snooze-button'),
-                  onPressed: working ? null : () => finish(false),
-                  icon: const Icon(Icons.snooze_rounded),
-                  label: const Text('Remind me in 10 minutes'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Colors.white54),
-                  ),
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),
