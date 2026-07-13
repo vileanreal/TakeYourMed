@@ -403,6 +403,21 @@ Future<bool> dismissAlarmHost() async {
   return false;
 }
 
+@visibleForTesting
+Future<void> runStartupAlarmSetup({
+  required NotificationResponse? initialResponse,
+  required Future<void> Function(NotificationResponse response)
+  handleInitialResponse,
+  required Future<void> Function({required bool reschedule}) refreshAlarmStatus,
+}) async {
+  if (initialResponse != null) {
+    await refreshAlarmStatus(reschedule: false);
+    await handleInitialResponse(initialResponse);
+  } else {
+    await refreshAlarmStatus(reschedule: true);
+  }
+}
+
 List<DarwinNotificationCategory> get medicineAlarmCategories => [
   DarwinNotificationCategory(
     'medicine_alarm',
@@ -472,6 +487,7 @@ class AlarmPreferences {
 class Alerts {
   Alerts._();
   static final instance = Alerts._();
+  static const alarmSoundResource = 'medicine_alarm';
   final plugin = FlutterLocalNotificationsPlugin();
   final ValueNotifier<NotificationResponse?> responses = ValueNotifier(null);
   NotificationResponse? initialResponse;
@@ -510,6 +526,7 @@ class Alerts {
       },
       onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
     );
+    await ensureAndroidAlarmChannel();
     initialized = true;
     if (captureLaunchDetails) {
       final launch = await plugin.getNotificationAppLaunchDetails();
@@ -519,16 +536,41 @@ class Alerts {
     }
   }
 
+  String get androidChannelId =>
+      'medicine_alarms_v4_s${preferences.sound ? 1 : 0}_v${preferences.vibrate ? 1 : 0}';
+
+  String get androidChannelName => preferences.sound
+      ? preferences.vibrate
+            ? 'Medicine alarms: sound + vibration'
+            : 'Medicine alarms: sound'
+      : preferences.vibrate
+      ? 'Medicine alarms: vibration'
+      : 'Medicine alarms: silent';
+
+  AndroidNotificationSound? get androidAlarmSound => preferences.sound
+      ? const RawResourceAndroidNotificationSound(alarmSoundResource)
+      : null;
+
+  AndroidNotificationChannel get androidAlarmChannel =>
+      AndroidNotificationChannel(
+        androidChannelId,
+        androidChannelName,
+        description: 'Urgent alarms for medication doses',
+        importance: Importance.max,
+        playSound: preferences.sound,
+        sound: androidAlarmSound,
+        enableVibration: preferences.vibrate,
+        audioAttributesUsage: AudioAttributesUsage.alarm,
+      );
+
+  Future<void> ensureAndroidAlarmChannel() async {
+    await _android?.createNotificationChannel(androidAlarmChannel);
+  }
+
   NotificationDetails get details => NotificationDetails(
     android: AndroidNotificationDetails(
-      'medicine_alarms_v3_s${preferences.sound ? 1 : 0}_v${preferences.vibrate ? 1 : 0}',
-      preferences.sound
-          ? preferences.vibrate
-                ? 'Medicine alarms: sound + vibration'
-                : 'Medicine alarms: sound'
-          : preferences.vibrate
-          ? 'Medicine alarms: vibration'
-          : 'Medicine alarms: silent',
+      androidChannelId,
+      androidChannelName,
       channelDescription: 'Urgent alarms for medication doses',
       importance: Importance.max,
       priority: Priority.max,
@@ -539,6 +581,7 @@ class Alerts {
       autoCancel: true,
       timeoutAfter: preferences.durationSeconds * 1000,
       playSound: preferences.sound,
+      sound: androidAlarmSound,
       enableVibration: preferences.vibrate,
       audioAttributesUsage: AudioAttributesUsage.alarm,
       additionalFlags: preferences.sound || preferences.vibrate
@@ -570,6 +613,7 @@ class Alerts {
   Future<void> savePreferences(AlarmPreferences value) async {
     preferences = value;
     await value.save();
+    await ensureAndroidAlarmChannel();
     if (!kIsWeb && value.autoDisplay) {
       await _android?.requestFullScreenIntentPermission();
     }
@@ -883,12 +927,14 @@ class _HomeState extends State<HomePage> with WidgetsBindingObserver {
         WidgetsBinding.instance.addPostFrameCallback((_) => welcome());
       }
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        await _refreshAlertStatus(reschedule: true);
         final initial = Alerts.instance.initialResponse;
-        if (initial != null) {
-          Alerts.instance.initialResponse = null;
-          _handleNotification(initial);
-        }
+        Alerts.instance.initialResponse = null;
+        await runStartupAlarmSetup(
+          initialResponse: initial,
+          refreshAlarmStatus: ({required bool reschedule}) =>
+              _refreshAlertStatus(reschedule: reschedule),
+          handleInitialResponse: _handleNotification,
+        );
       });
     }
   }
@@ -2621,7 +2667,9 @@ class _AlertCenterSheetState extends State<AlertCenterSheet> {
                   contentPadding: EdgeInsets.zero,
                   secondary: const Icon(Icons.volume_up_outlined),
                   title: const Text('Sound'),
-                  subtitle: const Text('Repeat the alarm sound until stopped'),
+                  subtitle: const Text(
+                    'Uses Android alarm volume and plays while locked',
+                  ),
                   value: preferences.sound,
                   onChanged: (value) => setState(
                     () => preferences = preferences.copyWith(sound: value),
